@@ -3,21 +3,33 @@ import re
 import asyncio
 import os
 import requests
+import cv2  # مكتبة معالجة الفيديوهات
 from datetime import datetime
 from PIL import Image, ImageChops, ImageStat
+
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, ForceReply
 from telegram.ext import ApplicationBuilder, ContextTypes, MessageHandler, filters, CommandHandler, CallbackQueryHandler, Application
+
+from telethon import TelegramClient
+from telethon.sessions import StringSession
 
 # إعداد السجلات
 logging.basicConfig(format='%(asctime)s - %(name)s - %(levelname)s - %(message)s', level=logging.INFO)
 logging.getLogger("httpx").setLevel(logging.WARNING) 
 
-# الإعدادات الأساسية
+# الإعدادات الأساسية للبوت
 TOKEN = '8520440293:AAHxlEGixgF2uOdLAgbpB6S5uFWgXrwAHko'
 CHANNEL_USERNAME = '@Serianumber99' 
-LIST_MESSAGE_ID = 219 # تم التعديل إلى 219 بناءً على طلبك
+LIST_MESSAGE_ID = 219 
 GROUP_ID = -1002588398038 
-OCR_API_KEY = 'K89276173888957' # مفتاح OCR المجاني
+OCR_API_KEY = 'K89276173888957'
+
+# إعدادات حساب Telethon (الجلسة الصامتة)
+API_ID = 26604893 
+API_HASH = 'b4dad6237531036f1a4bb2580e4985b1'
+STRING_SESSION = '1BJWap1wBuzwi_AQfbsYmVPJS4VjOwS-QqQuPQFhgRHx2ZcA65CIwl0TGqPOZjGfFqCfCIs5ED2dYi1MpA3mweKcRXtKCCL94j_geb1d9l5a54JPAtRNTrRhm9wQxBCVOh0MF-u5avJWWU_YI1VwHUC8g4dOGlHwiu10lp0F9DsMpYzzdBS5DCjeEP2VllZfgnr1dSWBGYN_yp-jdZrlcxZRNHCwcs276Mu7U30qp9rj0sP31S4WBwZfP3U7FxLuEgj-ZVTVrnsCRGkGEM-4hQzyLqbPM9GpdPX0PuEtc-eqlUjn_e2uvASEAU6yuk98RfH1xgKT2pdbJvjY2HLVDo2O-ymQ-s0U='
+
+t_client = TelegramClient(StringSession(STRING_SESSION), API_ID, API_HASH)
 
 CACHE = {
     "users": {},   
@@ -28,23 +40,16 @@ CACHE = {
 # ----------------- دوال الذكاء الاصطناعي والتشابه -----------------
 
 def get_ocr_text(image_path):
-    """إرسال الصورة لـ API لقراءتها"""
     try:
-        payload = {
-            'apikey': OCR_API_KEY,
-            'language': 'eng',
-            'isOverlayRequired': False,
-        }
+        payload = {'apikey': OCR_API_KEY, 'language': 'eng', 'isOverlayRequired': False}
         with open(image_path, 'rb') as f:
             r = requests.post('https://api.ocr.space/parse/image', files={image_path: f}, data=payload, timeout=15)
         result = r.json()
         return result.get('ParsedResults')[0].get('ParsedText').lower()
-    except Exception as e:
-        logging.error(f"OCR Error: {e}")
+    except Exception:
         return ""
 
 def get_tamper_score(image_path):
-    """كشف المونتاج (ELA)"""
     try:
         original = Image.open(image_path).convert('RGB')
         resaved = 'temp_check.jpg'
@@ -54,12 +59,38 @@ def get_tamper_score(image_path):
         stat = ImageStat.Stat(diff)
         if os.path.exists(resaved): os.remove(resaved)
         return sum(stat.mean)
-    except Exception as e:
-        logging.error(f"Tamper Check Error: {e}")
+    except Exception:
         return 0
 
+def process_video_ai(video_path):
+    """استخراج إطارات من الفيديو لفحص المونتاج وقراءة النص"""
+    try:
+        cap = cv2.VideoCapture(video_path)
+        if not cap.isOpened(): return 0, ""
+        
+        total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+        if total_frames == 0: return 0, ""
+            
+        # أخذ لقطة من منتصف الفيديو لضمان وضوح الشاشة
+        cap.set(cv2.CAP_PROP_POS_FRAMES, total_frames // 2)
+        ret, frame = cap.read()
+        ocr_text = ""
+        max_tamper = 0
+        
+        if ret:
+            temp_frame = "temp_vid_frame.jpg"
+            cv2.imwrite(temp_frame, frame)
+            ocr_text = get_ocr_text(temp_frame)
+            max_tamper = get_tamper_score(temp_frame)
+            if os.path.exists(temp_frame): os.remove(temp_frame)
+            
+        cap.release()
+        return max_tamper, ocr_text
+    except Exception as e:
+        logging.error(f"Video AI Error: {e}")
+        return 0, ""
+
 def get_longest_common_substring(s1, s2):
-    """حساب أطول سلسلة تطابق متتالية"""
     m = [[0] * (1 + len(s2)) for _ in range(1 + len(s1))]
     longest = 0
     for x in range(1, 1 + len(s1)):
@@ -72,7 +103,6 @@ def get_longest_common_substring(s1, s2):
     return longest
 
 def get_lcs_length(s1, s2):
-    """حساب أطول سلسلة تطابق غير متتالية"""
     m, n = len(s1), len(s2)
     dp = [[0] * (n + 1) for _ in range(m + 1)]
     for i in range(1, m + 1):
@@ -85,43 +115,41 @@ def get_lcs_length(s1, s2):
 
 # ----------------- دوال البوت الأساسية -----------------
 
-async def build_cache(bot):
+async def build_cache_silently():
+    """استخدام جلسة تيليثون لجلب الأرشيف بصمت تام بدون توجيه رسائل"""
     if CACHE["loaded"]: return
-    count = 0
-    print("⏳ بدأت عملية فحص الأرشيف...")
-    for msg_id in range(1, LIST_MESSAGE_ID + 1):
-        try:
-            msg = await bot.forward_message(chat_id=GROUP_ID, from_chat_id=CHANNEL_USERNAME, message_id=msg_id)
-            text = (msg.text or msg.caption or "").lower()
-            date = (msg.forward_date or msg.date).replace(tzinfo=None)
-            
-            user_match = re.search(r"@[\w\d_]+", text)
-            serial_match = re.search(r"([a-z0-9]{5,})", text) 
-            
-            if user_match:
-                u = user_match.group(0)
-                s = serial_match.group(0) if serial_match else "unknown"
-                CACHE["users"][u] = {"serial": s, "date": date, "msg_id": msg_id}
-                CACHE["serials"][s] = u
-                count += 1
-            
-            await bot.delete_message(chat_id=GROUP_ID, message_id=msg.message_id)
-            await asyncio.sleep(0.05)
-        except Exception:
-            continue
-    
-    CACHE["loaded"] = True
-    print(f"✅ تم تحميل الكاش: {count} لاعب مفهرس.")
+    print("⏳ الجلسة الصامتة: جاري قراءة القائمة وتحديث قاعدة البيانات...")
+    try:
+        # جلب الرسالة المحددة من القناة مباشرة
+        message = await t_client.get_messages(CHANNEL_USERNAME, ids=LIST_MESSAGE_ID)
+        if message and message.text:
+            lines = message.text.split('\n')
+            count = 0
+            for line in lines:
+                user_match = re.search(r"@[\w\d_]+", line)
+                serial_match = re.search(r"\|\s*([a-zA-Z0-9]{5,})", line)
+                
+                if user_match and serial_match:
+                    u = user_match.group(0).lower()
+                    s = serial_match.group(1).lower()
+                    CACHE["users"][u] = {"serial": s, "date": message.date.replace(tzinfo=None), "msg_id": LIST_MESSAGE_ID}
+                    CACHE["serials"][s] = u
+                    count += 1
+            CACHE["loaded"] = True
+            print(f"✅ تم تحديث الكاش بصمت: {count} لاعب مفهرس.")
+    except Exception as e:
+        print(f"❌ خطأ في الجلسة الصامتة: {e}")
 
 async def post_init(application: Application):
-    asyncio.create_task(build_cache(application.bot))
+    await t_client.connect() # ربط حساب التيليثون
+    asyncio.create_task(build_cache_silently())
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text("🚀 بوت الفحص الذكي جاهز للعمل!")
+    await update.message.reply_text("🚀 بوت الفحص الذكي (المدعوم بالذكاء الاصطناعي للفيديوهات والصور) جاهز!")
 
 async def handle_registration(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not CACHE["loaded"]:
-        await update.message.reply_text("⏳ جاري تحديث بيانات الأرشيف.. حاول بعد لحظات.")
+        await update.message.reply_text("⏳ جاري تهيئة الذكاء الاصطناعي والجلسة.. جرب بعد ثوانٍ.")
         return
 
     if not update.message.caption: return
@@ -142,7 +170,6 @@ async def handle_registration(update: Update, context: ContextTypes.DEFAULT_TYPE
     user_data = CACHE["users"].get(new_user)
     serial_owner = CACHE["serials"].get(new_serial)
 
-    # التحقق من 15 يوم
     if user_data and user_data['serial'] == new_serial:
         await update.message.reply_text("⚠️ هذا اللاعب مسجل مسبقاً بنفس البيانات.")
         return
@@ -160,31 +187,30 @@ async def handle_registration(update: Update, context: ContextTypes.DEFAULT_TYPE
         action_type = "CHANGE_USER"
         found_info = f"🔄 تغيير يوزر لنفس الجهاز."
 
-    await update.message.reply_text("✅ تم استلام طلبك، يتم فحصه عبر الذكاء الاصطناعي...")
+    loading_msg = await update.message.reply_text("✅ تم الاستلام.. 🤖 جاري فحص (التشابه + التلاعب) يرجى الانتظار...")
 
-    # تنزيل الميديا للفحص
     is_photo = bool(update.message.photo)
     file_obj = await update.message.photo[-1].get_file() if is_photo else await update.message.video.get_file()
-    temp_path = f"temp_{update.message.chat_id}.{'jpg' if is_photo else 'mp4'}"
+    temp_path = f"temp_media_{update.message.chat_id}.{'jpg' if is_photo else 'mp4'}"
     await file_obj.download_to_drive(temp_path)
 
-    # 1. فحص الذكاء الاصطناعي (متاح للصور فقط)
-    ai_status = "📹 **فيديو:** لا يدعم الفحص التلقائي للنص والمونتاج."
+    # 1. فحص الذكاء الاصطناعي للصور والفيديوهات
     if is_photo:
         tamper_score = get_tamper_score(temp_path)
         ocr_text = get_ocr_text(temp_path)
-        
-        if tamper_score > 15:
-            ai_status = "⚠️ **مونتاج / فوتوشوب:** تم كشف تلاعب في الصورة!"
-        elif new_serial not in ocr_text.replace(" ", ""):
-            ai_status = f"❌ **غلط تماماً:** الرقم المكتوب غير موجود في الصورة!"
-        else:
-            ai_status = "✅ **حقيقي:** الصورة سليمة والرقم مطابق."
+    else:
+        tamper_score, ocr_text = process_video_ai(temp_path)
 
-    if os.path.exists(temp_path):
-        os.remove(temp_path)
+    if tamper_score > 15:
+        ai_status = "⚠️ **مونتاج / تلاعب:** تم كشف تعديل أو فوتوشوب في المرفق!"
+    elif new_serial not in ocr_text.replace(" ", ""):
+        ai_status = f"❌ **غلط تماماً:** الرقم المكتوب غير موجود في (الصورة/الفيديو)!"
+    else:
+        ai_status = "✅ **حقيقي:** المرفق سليم والرقم مطابق تماماً."
 
-    # 2. فحص التشابه المتقدم
+    if os.path.exists(temp_path): os.remove(temp_path)
+
+    # 2. فحص التشابه المتقدم للتسلسلي
     similarity_warnings = []
     for old_serial, old_user in CACHE["serials"].items():
         if old_serial == new_serial: continue 
@@ -192,13 +218,13 @@ async def handle_registration(update: Update, context: ContextTypes.DEFAULT_TYPE
         non_consecutive = get_lcs_length(new_serial, old_serial)
         
         if consecutive >= 3:
-            similarity_warnings.append(f"- `@{old_user}`: متشابه متتالي ({consecutive} أحرف)")
+            similarity_warnings.append(f"⚠️ `@{old_user}`: متشابه מתتالي ({consecutive} أحرف)")
         elif non_consecutive >= 5:
-            similarity_warnings.append(f"- `@{old_user}`: متشابه متقاطع ({non_consecutive} أحرف)")
+            similarity_warnings.append(f"⚠️ `@{old_user}`: متشابه متقاطع ({non_consecutive} أحرف)")
             
-    sim_text = "✅ لا يوجد تشابه خطير" if not similarity_warnings else "\n".join(similarity_warnings[:5]) # عرض أول 5 تحذيرات فقط
+    sim_text = "✅ لا يوجد تشابه خطير" if not similarity_warnings else "\n".join(similarity_warnings[:5])
 
-    # إعداد رسالة الأدمن
+    # إعداد الإرسال للجروب
     keyboard = [[
         InlineKeyboardButton("✅ قبول", callback_data=f"ok_{update.message.chat_id}"),
         InlineKeyboardButton("❌ رفض", callback_data=f"no_{update.message.chat_id}")
@@ -207,40 +233,29 @@ async def handle_registration(update: Update, context: ContextTypes.DEFAULT_TYPE
     context.bot_data[f"data_{update.message.chat_id}"] = {"u": new_user, "s": new_serial, "type": action_type}
 
     final_caption = (
-        f"📝 **طلب فحص:**\n{found_info}\n"
+        f"📝 **طلب فحص جديد:**\n{found_info}\n"
         f"👤 اليوزر: {new_user}\n"
-        f"🔢 السيريال: {new_serial}\n"
+        f"🔢 السيريال: `{new_serial}`\n"
         f"🆔 ID: `{update.message.chat_id}`\n\n"
         f"**🤖 فحص الذكاء الاصطناعي:**\n{ai_status}\n\n"
         f"**🔍 فحص التشابه المتقدم:**\n{sim_text}"
     )
 
-    # إرسال الصورة أو الفيديو للجروب
+    await loading_msg.delete()
+
     if is_photo:
-        await context.bot.send_photo(
-            chat_id=GROUP_ID,
-            photo=update.message.photo[-1].file_id,
-            caption=final_caption,
-            reply_markup=InlineKeyboardMarkup(keyboard)
-        )
+        await context.bot.send_photo(chat_id=GROUP_ID, photo=update.message.photo[-1].file_id, caption=final_caption, reply_markup=InlineKeyboardMarkup(keyboard))
     else:
-        await context.bot.send_video(
-            chat_id=GROUP_ID,
-            video=update.message.video.file_id,
-            caption=final_caption,
-            reply_markup=InlineKeyboardMarkup(keyboard)
-        )
+        await context.bot.send_video(chat_id=GROUP_ID, video=update.message.video.file_id, caption=final_caption, reply_markup=InlineKeyboardMarkup(keyboard))
 
 async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
-    # تمت إزالة قيد الـ ADMIN_USERNAMES للجميع في الجروب
-    
     data = query.data.split("_")
     action, uid = data[0], data[1]
     user_info = context.bot_data.get(f"data_{uid}")
 
     if not user_info:
-        await query.answer("بيانات الطلب منتهية.")
+        await query.answer("بيانات الطلب منتهية.", show_alert=True)
         return
 
     if action == "ok":
@@ -254,9 +269,9 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def process_update(context, uid, info):
     try:
-        channel_msg = await context.bot.forward_message(chat_id=GROUP_ID, from_chat_id=CHANNEL_USERNAME, message_id=LIST_MESSAGE_ID)
-        lines = channel_msg.text.split('\n')
-        await context.bot.delete_message(chat_id=GROUP_ID, message_id=channel_msg.message_id)
+        # استخدام الجلسة لجلب الرسالة بصمت بدلاً من توجيهها
+        message = await t_client.get_messages(CHANNEL_USERNAME, ids=LIST_MESSAGE_ID)
+        lines = message.text.split('\n')
 
         updated = False
         target_u = info['u']
@@ -280,7 +295,9 @@ async def process_update(context, uid, info):
 
         if updated:
             new_text = "\n".join(lines)
+            # تعديل الرسالة مباشرة عبر البوت
             await context.bot.edit_message_text(chat_id=CHANNEL_USERNAME, message_id=LIST_MESSAGE_ID, text=new_text)
+            
             CACHE["users"][target_u] = {"serial": target_s, "date": datetime.utcnow(), "msg_id": LIST_MESSAGE_ID}
             CACHE["serials"][target_s] = target_u
             await context.bot.send_message(chat_id=int(uid), text="✅ تم قبول طلبك وتحديث بياناتك في القائمة!")
@@ -301,16 +318,12 @@ async def handle_reject_reply(update: Update, context: ContextTypes.DEFAULT_TYPE
 
 def main():
     app = ApplicationBuilder().token(TOKEN).post_init(post_init).build()
-    
     app.add_handler(CommandHandler("start", start))
-    
-    # التعديل: قبول الصور أو الفيديوهات بشرط وجود كابشن (النص)
     app.add_handler(MessageHandler((filters.PHOTO | filters.VIDEO) & filters.CAPTION, handle_registration))
-    
     app.add_handler(CallbackQueryHandler(button_callback))
     app.add_handler(MessageHandler(filters.REPLY & filters.TEXT, handle_reject_reply))
     
-    print("🤖 البوت يعمل الآن بكامل مميزات الذكاء الاصطناعي...")
+    print("🤖 البوت يعمل الآن.. يتم استخدام الجلسة في الخلفية بصمت تام.")
     app.run_polling()
 
 if __name__ == '__main__':
