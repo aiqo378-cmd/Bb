@@ -9,30 +9,29 @@ import cv2
 import numpy as np
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, ForceReply
 from telegram.ext import ApplicationBuilder, ContextTypes, MessageHandler, filters, CommandHandler, CallbackQueryHandler
-from telethon import TelegramClient, events
+from telethon import TelegramClient
 from telethon.sessions import StringSession
-from telethon.tl.types import MessageMediaPhoto, MessageMediaDocument
 
 # -------------------- إعدادات الحسابات --------------------
 BOT_TOKEN = '8520440293:AAHxlEGixgF2uOdLAgbpB6S5uFWgXrwAHko'
 CHANNEL_USERNAME = '@Serianumber99'
 GROUP_ID = -1002588398038
 
-# جلسة التيلثون (صامتة)
+# Telethon (صامت، يستخدم فقط لقراءة القناة وبناء الكاش)
 API_ID = 26604893
 API_HASH = 'b4dad6237531036f1a4bb2580e4985b1'
 STRING_SESSION = '1BJWap1wBuzwi_AQfbsYmVPJS4VjOwS-QqQuPQFhgRHx2ZcA65CIwl0TGqPOZjGfFqCfCIs5ED2dYi1MpA3mweKcRXtKCCL94j_geb1d9l5a54JPAtRNTrRhm9wQxBCVOh0MF-u5avJWWU_YI1VwHUC8g4dOGlHwiu10lp0F9DsMpYzzdBS5DCjeEP2VllZfgnr1dSWBGYN_yp-jdZrlcxZRNHCwcs276Mu7U30qp9rj0sP31S4WBwZfP3U7FxLuEgj-ZVTVrnsCRGkGEM-4hQzyLqbPM9GpdPX0PuEtc-eqlUjn_e2uvASEAU6yuk98RfH1xgKT2pdbJvjY2HLVDo2O-ymQ-s0U='
 
 OCR_API_KEY = 'K89276173888957'
 
-# قائمة أدمنية إضافية (اختياري)
+# قائمة أسماء مستخدمين إضافيين (احتياطي)
 ADMIN_USERNAMES = [
     "ahsvsjsv", "OQO_e1", "H4_OT", "Q_12_T", "h896556",
     "murtaza_said", "c1c_2", "BOTrika_22", "oaa_c", "mwsa_20",
     "feloo9", "yas_r7", "Hu2009", "PHT_10", "l_7yk", "levil_8"
 ]
 
-# -------------------- الكاش --------------------
+# -------------------- الكاش (من القناة) --------------------
 CACHE = {
     "users": {},   # {username: {"serial": serial, "date": datetime, "msg_id": int}}
     "serials": {}, # {serial: username}
@@ -40,10 +39,9 @@ CACHE = {
     "last_msg_id": 0
 }
 
-# -------------------- عميل التيلثون --------------------
 telethon_client = TelegramClient(StringSession(STRING_SESSION), API_ID, API_HASH)
 
-# -------------------- دوال فحص الصور والفيديو --------------------
+# -------------------- دوال فحص الميديا --------------------
 def extract_frame_from_video(video_path: str, output_image_path: str) -> bool:
     """استخراج أول إطار من الفيديو باستخدام OpenCV"""
     try:
@@ -92,7 +90,7 @@ async def check_media_authenticity(file_path: str, expected_serial: str, is_vide
     if is_video:
         frame_path = "temp_video_frame.jpg"
         if not extract_frame_from_video(file_path, frame_path):
-            return "⚠️ **فيديو:** تعذر استخراج إطار للفحص (تأكد من مكتبة opencv)"
+            return "⚠️ **فيديو:** تعذر استخراج إطار للفحص (تأكد من مكتبة opencv-python-headless)"
         image_path = frame_path
     else:
         image_path = file_path
@@ -134,36 +132,43 @@ def longest_common_subsequence(s1: str, s2: str) -> int:
                 dp[i][j] = max(dp[i-1][j], dp[i][j-1])
     return dp[m][n]
 
-def check_serial_similarity(new_serial: str) -> list:
+def check_serial_similarity(new_serial: str, max_warnings=5) -> tuple:
+    """تعيد (قائمة التحذيرات المختصرة، العدد الإجمالي)"""
     warnings = []
+    total = 0
     new_serial_lower = new_serial.lower()
     for old_serial, old_user in CACHE["serials"].items():
         old_serial_lower = old_serial.lower()
         if new_serial_lower == old_serial_lower:
-            warnings.append(f"⚠️ **تطابق تام** مع السيريال `{old_serial}` الخاص بـ @{old_user}")
+            total += 1
+            if len(warnings) < max_warnings:
+                warnings.append(f"⚠️ **تطابق تام** مع `{old_serial}` لـ @{old_user}")
             continue
         consecutive = longest_consecutive_substring(new_serial_lower, old_serial_lower)
         lcs_len = longest_common_subsequence(new_serial_lower, old_serial_lower)
         if consecutive >= 3:
-            warnings.append(f"⚠️ **تشابه متتالي** ({consecutive} حروف) مع `{old_serial}` الخاص بـ @{old_user}")
+            total += 1
+            if len(warnings) < max_warnings:
+                warnings.append(f"⚠️ **تشابه متتالي** ({consecutive} حروف) مع `{old_serial}` لـ @{old_user}")
         elif lcs_len >= 5:
-            warnings.append(f"⚠️ **تشابه غير متتالي** ({lcs_len} حروف) مع `{old_serial}` الخاص بـ @{old_user}")
-    return warnings
+            total += 1
+            if len(warnings) < max_warnings:
+                warnings.append(f"⚠️ **تشابه غير متتالي** ({lcs_len} حروف) مع `{old_serial}` لـ @{old_user}")
+    return warnings, total
 
-# -------------------- بناء الكاش باستخدام التيلثون (جميع رسائل القناة) --------------------
+# -------------------- بناء الكاش باستخدام Telethon --------------------
 async def build_cache_with_telethon():
-    """يجلب جميع رسائل القناة عبر Telethon ويبني الكاش"""
     if CACHE["loaded"]:
         return
     print("⏳ جاري فهرسة جميع رسائل القناة عبر Telethon...")
     count = 0
-    last_msg_id = 0
+    last_id = 0
     try:
         async for message in telethon_client.iter_messages(CHANNEL_USERNAME, reverse=True):
-            last_msg_id = message.id
+            last_id = message.id
             text = (message.text or "").lower()
             date = message.date.replace(tzinfo=None)
-            # البحث عن صيغة [@user | serial] أو @user | serial
+            # البحث عن صيغ مثل [@user | serial] أو @user | serial
             matches = re.findall(r'@([\w\d_]+)\s*[|/-]\s*([\w\d_/]+)', text)
             for user, serial in matches:
                 user_full = f"@{user}"
@@ -174,24 +179,23 @@ async def build_cache_with_telethon():
     except Exception as e:
         logging.error(f"خطأ في جلب الرسائل: {e}")
     CACHE["loaded"] = True
-    CACHE["last_msg_id"] = last_msg_id
-    print(f"✅ تم تحميل الكاش: {count} لاعب من {last_msg_id} رسالة.")
+    CACHE["last_msg_id"] = last_id
+    print(f"✅ تم تحميل الكاش: {count} لاعب من {last_id} رسالة.")
 
 async def periodic_cache_updater():
-    """تحديث الكاش كل 60 ثانية باستخدام Telethon"""
     while True:
         await asyncio.sleep(60)
         if not CACHE["loaded"]:
             continue
         try:
             last_id = CACHE["last_msg_id"]
-            new_messages = []
-            async for message in telethon_client.iter_messages(CHANNEL_USERNAME, min_id=last_id, reverse=True):
-                if message.id > last_id:
-                    new_messages.append(message)
-            if new_messages:
-                print(f"🔄 تحديث الكاش: {len(new_messages)} رسائل جديدة")
-                for msg in new_messages:
+            new_msgs = []
+            async for msg in telethon_client.iter_messages(CHANNEL_USERNAME, min_id=last_id, reverse=True):
+                if msg.id > last_id:
+                    new_msgs.append(msg)
+            if new_msgs:
+                print(f"🔄 تحديث الكاش: {len(new_msgs)} رسائل جديدة")
+                for msg in new_msgs:
                     text = (msg.text or "").lower()
                     date = msg.date.replace(tzinfo=None)
                     matches = re.findall(r'@([\w\d_]+)\s*[|/-]\s*([\w\d_/]+)', text)
@@ -207,7 +211,7 @@ async def periodic_cache_updater():
 
 # -------------------- دوال البوت (python-telegram-bot) --------------------
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text("🚀 بوت الفحص الذكي (مع Telethon) جاهز!\nأرسل صورة أو فيديو مع كابشن:\n`@username | serial`")
+    await update.message.reply_text("🚀 بوت الفحص الذكي جاهز!\nأرسل صورة أو فيديو مع كابشن:\n`@username | serial`")
 
 async def is_admin(user_id: int, chat_id: int, context: ContextTypes.DEFAULT_TYPE) -> bool:
     try:
@@ -280,8 +284,13 @@ async def handle_registration(update: Update, context: ContextTypes.DEFAULT_TYPE
 
     # فحص الميديا
     authenticity = await check_media_authenticity(file_path, new_serial, is_video)
-    similarity_warnings = check_serial_similarity(new_serial)
-    similarity_text = "\n".join(similarity_warnings) if similarity_warnings else "✅ لا يوجد تشابه مع أي سيريال مسجل."
+    # فحص التشابه
+    warnings, total_similar = check_serial_similarity(new_serial, max_warnings=5)
+    similarity_text = "\n".join(warnings)
+    if total_similar > len(warnings):
+        similarity_text += f"\n⚠️ **و {total_similar - len(warnings)} تحذيرات أخرى**"
+    if not warnings:
+        similarity_text = "✅ لا يوجد تشابه مع أي سيريال مسجل."
 
     try:
         os.remove(file_path)
@@ -300,9 +309,10 @@ async def handle_registration(update: Update, context: ContextTypes.DEFAULT_TYPE
         f"👤 اليوزر: {new_user}\n🔢 السيريال: {new_serial}\n"
         f"🆔 ID: `{update.message.chat_id}`\n\n"
         f"🔍 **فحص الميديا:**\n{authenticity}\n\n"
-        f"🔁 **فحص التشابه:**\n{similarity_text}"
+        f"🔁 **فحص التشابه (إجمالي {total_similar}):**\n{similarity_text}"
     )
 
+    # إرسال الطلب إلى مجموعة الإدارة
     if update.message.photo:
         await context.bot.send_photo(GROUP_ID, update.message.photo[-1].file_id, caption=caption, reply_markup=InlineKeyboardMarkup(keyboard))
     else:
@@ -324,6 +334,7 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     if action == "ok":
+        # تحديث الكاش وإضافة الزوج الجديد (بدون تعديل رسالة القناة، فقط الكاش)
         CACHE["users"][user_info['u']] = {"serial": user_info['s'], "date": datetime.utcnow(), "msg_id": 0}
         CACHE["serials"][user_info['s']] = user_info['u']
         await query.message.delete()
@@ -345,28 +356,26 @@ async def handle_reject_reply(update: Update, context: ContextTypes.DEFAULT_TYPE
 
 # -------------------- بدء التشغيل --------------------
 async def main():
-    # بدء عميل التيلثون
+    # بدء Telethon (صامت)
     await telethon_client.start()
     print("✅ Telethon connected (silent mode)")
 
-    # بناء الكاش
+    # بناء الكاش من القناة
     await build_cache_with_telethon()
-    # تشغيل المحدث الدوري
     asyncio.create_task(periodic_cache_updater())
 
-    # تشغيل بوت telegram
+    # بدء بوت Telegram
     app = ApplicationBuilder().token(BOT_TOKEN).build()
     app.add_handler(CommandHandler("start", start))
     app.add_handler(MessageHandler((filters.PHOTO | filters.VIDEO) & filters.CAPTION, handle_registration))
     app.add_handler(CallbackQueryHandler(button_callback))
     app.add_handler(MessageHandler(filters.REPLY & filters.TEXT, handle_reject_reply))
 
-    print("🤖 البوت يعمل مع Telethon لفحص التشابه والفيديو...")
+    print("🤖 البوت يعمل مع Telethon (تشابه + فيديو)...")
     await app.initialize()
     await app.start()
     await app.updater.start_polling()
 
-    # إبقاء الحلقة مفتوحة
     await asyncio.Event().wait()
 
 if __name__ == '__main__':
